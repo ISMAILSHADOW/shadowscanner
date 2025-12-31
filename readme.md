@@ -1,6 +1,6 @@
 # ShadowScanner
 
-A fast, async asset discovery tool for bug bounty hunting.
+A fast, async (Not yet) asset discovery tool for bug bounty hunting.
 
 ## Installation
 ```bash
