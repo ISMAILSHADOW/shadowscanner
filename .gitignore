@@ -1,0 +1,15 @@
+# Python Build Artifacts
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+
+# Tool Output (Don't commit findings!)
+findings.txt
+
+test.py
+
+# IDE Settings
+.vscode/
+.idea/
