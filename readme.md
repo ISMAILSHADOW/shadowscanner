@@ -3,7 +3,9 @@
 A fast, async asset discovery tool for bug bounty hunting.
 
 ## Installation
-pip install .
+```bash
+pip install shadowscanner
+```
 
 ## Usage
 shadowscanner -h
