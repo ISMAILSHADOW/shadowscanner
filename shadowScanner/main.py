@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 
-import os
+from pathlib import Path
 import re
 import json
+import shutil
+import subprocess
 import time
 import logging
 import argparse
 import requests
-import urllib3
 from tqdm import tqdm
-from wakepy import keep
 from datetime import datetime
 from typing import List, Dict, Optional
 import shadowScanner.helpers as HELPERS
 import shadowScanner.globals as GLOBALS
-from requests.adapters import HTTPAdapter
-from urllib.parse import urlparse, urlunparse
 from shadowScanner.validation import validate_args
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger()
 
@@ -29,42 +26,21 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("charset_normalizer").setLevel(logging.WARNING)
 
 
-class TargetFinder:
-    def __init__(
-        self,
-        hackerone_key: Optional[str],
-        use_subdomains: bool,
-        target_path: str,
-        max_threads: int,
-        success_status_codes: List[int],
-        exclude_content: List[str],
-        include_content: List[str],
-    ):
+class TargetGenerator:
+    """
+    Responsible ONLY for fetching programs, resolving wildcards,
+    and generating the master list of targets.
+    """
+
+    def __init__(self, hackerone_key: Optional[str], use_subdomains: bool):
         self.hackerone_key = hackerone_key
         self.use_subdomains = use_subdomains
-        self.target_path = (
-            target_path if target_path.startswith("/") else f"/{target_path}"
-        )
-        self.max_threads = max_threads
-        self.success_status_codes = success_status_codes
-        self.exclude_content = [s.lower() for s in (exclude_content or [])]
-        self.include_content = [s.lower() for s in (include_content or [])]
-
         self.session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=self.max_threads,
-            pool_maxsize=self.max_threads,
-            max_retries=0
-        )
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
         self.session.headers.update(
             {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
         )
-
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def fetch_hackerone_programs(self) -> List[Dict]:
         if not self.hackerone_key:
@@ -176,7 +152,6 @@ class TargetFinder:
 
         return programs
 
-
     def fetch_intigriti_programs(self) -> List[Dict]:
         """
         Fetches Intigriti programs from the community-maintained list.
@@ -199,7 +174,9 @@ class TargetFinder:
                             "handle": program.get("handle"),
                             "url": program.get("url"),
                             "data": {
-                                "targets": program.get("targets", {}).get("in_scope", [])
+                                "targets": program.get("targets", {}).get(
+                                    "in_scope", []
+                                )
                             },
                         }
                     )
@@ -264,15 +241,15 @@ class TargetFinder:
         elif platform == "intigriti":
             try:
                 raw_targets = program["data"].get("targets", [])
-                
+
                 for target in raw_targets:
                     t_type = target.get("type", "")
                     if not t_type:
                         continue
-                    
+
                     t_type = t_type.lower()
                     endpoint = target.get("endpoint", "")
-                    
+
                     if t_type == "wildcard":
                         if self.use_subdomains:
                             targets.append(endpoint)
@@ -281,84 +258,19 @@ class TargetFinder:
                             targets.append(HELPERS.add_https_prefix(clean))
                     elif t_type == "url":
                         targets.append(HELPERS.add_https_prefix(endpoint))
-                            
+
             except Exception as e:
                 logger.warning(f"Error extracting Intigriti targets: {e}")
 
         return targets
 
-
-    def save_targets_list(self, urls: set[str]):
-        """Saves the fully enumerated list of URLs to disk."""
-        data = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "urls": sorted(urls)
-        }
-        with open(GLOBALS.TARGETS_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-        logger.info(f"Saved {len(urls)} resolved targets to {GLOBALS.TARGETS_FILE}")
-
-    def load_targets_list(self) -> Optional[set[str]]:
-        """Loads the fully enumerated list if it exists."""
-        if not GLOBALS.TARGETS_FILE.exists():
-            return None
-
-        try:
-            with open(GLOBALS.TARGETS_FILE, 'r') as f:
-                data = json.load(f)
-            
-            print(f"\n[!] Found cached target list from {data.get('timestamp')}")
-            print(f"    Contains {len(data.get('urls', []))} pre-resolved URLs.")
-            
-            while True:
-                choice = input("    Skip generation and use this list? (y/n): ").strip().lower()
-                if choice in ['y', 'yes']:
-                    return set(data.get("urls", {}))
-                elif choice in ['n', 'no']:
-                    return None
-        except Exception as e:
-            logger.warning(f"Could not load targets file: {e}")
-            return None
-
-    def save_checkpoint(self, scanned_urls: set, findings: List[Dict]):
-        """Saves progress and findings."""
-        data = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "target_path": self.target_path,
-            "scanned_urls": list(scanned_urls),
-            "findings": findings
-        }
-        
-        temp = GLOBALS.CHECKPOINT_FILE.with_suffix('.tmp')
-        with open(temp, 'w') as f:
-            json.dump(data, f)
-        temp.replace(GLOBALS.CHECKPOINT_FILE)
-
-    def load_checkpoint(self) -> tuple[set, List[Dict]]:
-        """Returns (set_of_scanned_urls, list_of_findings)"""
-        if not GLOBALS.CHECKPOINT_FILE.exists():
-            return set(), []
-
-        try:
-            with open(GLOBALS.CHECKPOINT_FILE, 'r') as f:
-                data = json.load(f)
-
-            if data.get("target_path") != self.target_path:
-                return set(), []
-
-            print(f"\n[!] Found scan checkpoint.")
-            print(f"    Already scanned: {len(data.get('scanned_urls', []))} URLs")
-            print(f"    Found so far: {len(data.get('findings', []))} issues")
-            
-            if input("    Resume scan? (y/n): ").lower() in ['y', 'yes']:
-                return set(data.get("scanned_urls", [])), data.get("findings", [])
-        except Exception:
-            pass
-        return set(), []
-
-
     def enumerate_subdomains(self, wildcard: str) -> List[str]:
+        """
+        Uses the installed 'subfinder' CLI tool to enumerate subdomains.
+        Much more reliable than querying crt.sh directly via requests.
+        """
         subdomains = []
+        
         domains = re.findall(
             r"\*[\w\.-]*?\.([\w\.-]+[a-z]{2,})", wildcard, re.IGNORECASE
         )
@@ -372,33 +284,40 @@ class TargetFinder:
         unique_domains = set(domains)
 
         for domain in unique_domains:
-            logger.info(
-                f"Enumerating subdomains for {domain} via certificate transparency..."
-            )
+            logger.info(f"Running subfinder for {domain}...")
+
+            # Skipping tlds
+            if not "." in domain:
+                continue
 
             try:
-                response = self.session.get(
-                    f"https://crt.sh/?q=%.{domain}&output=json", timeout=30
+                if not shutil.which("subfinder"):
+                    logger.error("Subfinder not found! Please install it with: go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
+                    subdomains.append(f"https://{domain}")
+                    continue
+
+                command = ["subfinder", "-d", domain, "-silent", "-all"]
+                
+                process = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=300 
                 )
 
-                if response.status_code == 200:
-                    try:
-                        certs = response.json()
-                        found_domains = set()
+                if process.returncode == 0:
+                    found = process.stdout.splitlines()
+                    logger.info(f"  > Found {len(found)} subdomains for {domain}")
+                    
+                    for sub in found:
+                        sub = sub.strip()
+                        if sub:
+                            subdomains.append(f"https://{sub}")
+                else:
+                    logger.warning(f"Subfinder error for {domain}: {process.stderr}")
 
-                        for cert in certs:
-                            name_value = cert.get("name_value", "")
-                            for subdomain in name_value.split("\n"):
-                                subdomain = subdomain.strip()
-                                if subdomain and "*" not in subdomain:
-                                    found_domains.add(subdomain)
-
-                        for subdomain in list(found_domains):
-                            subdomains.append(f"https://{subdomain}")
-
-                    except json.JSONDecodeError:
-                        logger.warning(f"crt.sh returned invalid JSON for {domain}")
-
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Subfinder timed out for {domain}")
             except Exception as e:
                 logger.warning(f"Error enumerating subdomains for {domain}: {e}")
 
@@ -437,52 +356,6 @@ class TargetFinder:
             logger.warning(f"Error reading existing program file: {e}")
             return []
 
-    def check_path(self, url: str) -> Optional[Dict]:
-        parsed = urlparse(url)
-        clean_path = parsed.path.replace("*", "").rstrip("/")
-        base_url = urlunparse((parsed.scheme, parsed.netloc, clean_path, "", "", ""))
-
-        full_url = f"{base_url}{self.target_path}"
-
-        try:
-            response = self.session.get(
-                full_url, timeout=(3, 5), verify=False, allow_redirects=True,
-            )
-
-            if response.status_code in self.success_status_codes:
-                content = response.text
-                content_lower = content.lower()
-
-                if self.exclude_content:
-                    if any(
-                        exclusion in content_lower for exclusion in self.exclude_content
-                    ):
-                        return None
-
-                if self.include_content:
-                    if not (
-                        any(
-                            [
-                                inclusion in content_lower
-                                for inclusion in self.include_content
-                            ]
-                        )
-                    ):
-                        return None
-
-                return {
-                    "url": full_url,
-                    "vulnerability": f"Exposed {self.target_path}",
-                    "status": response.status_code,
-                    "length": len(response.content),
-                    "content": content,
-                }
-
-        except requests.RequestException:
-            pass
-
-        return None
-
     def process_program(self, program: Dict) -> List[str]:
         raw_targets = self.extract_targets(program)
         final_urls = []
@@ -496,186 +369,128 @@ class TargetFinder:
 
         return final_urls
 
-    def run(self, use_hackerone: bool, use_bugcrowd: bool, use_intigriti: bool):
-        with keep.running():
-            all_urls = self.load_targets_list()
+    def save_targets_to_text(self, urls: set[str]):
+        """Saves URLs to a .txt file, optionally skipping the first N items."""
+        sorted_urls = sorted(urls)
 
-            if all_urls is None:
-                logger.info("Generating fresh target list (Fetching APIs + Enumerating Subdomains)...")
-                
-                all_programs = self.load_existing_programs()
-                if not all_programs:
-                    if use_hackerone: all_programs.extend(self.fetch_hackerone_programs())
-                    if use_bugcrowd: all_programs.extend(self.fetch_bugcrowd_programs())
-                    if use_intigriti: all_programs.extend(self.fetch_intigriti_programs())
-                    
-                    HELPERS.store_in_cache("programs", {
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "data": all_programs
-                    })
+        with open(GLOBALS.TARGETS_FILE, "w") as f:
+            for url in sorted_urls:
+                f.write(f"{url}\n")
 
-                logger.info(f"Enumerating subdomains for {len(all_programs)} programs...")
-                generated_urls = []
-                for prog in tqdm(all_programs, desc="Processing Programs"):
-                    generated_urls.extend(self.process_program(prog))
-                
-                all_urls = set(generated_urls)
-                
-                self.save_targets_list(all_urls)
+        logger.info(f"Saved target list to {GLOBALS.TARGETS_FILE}")
+
+    def load_targets_list(self) -> Optional[set[str]]:
+        """Loads the fully enumerated list if it exists."""
+        if not (Path.home() / ".cache" / "shadowScanner" / "targets.json").exists():
+            return None
+
+        try:
+            with open(
+                (Path.home() / ".cache" / "shadowScanner" / "targets.json"), "r"
+            ) as f:
+                data = json.load(f)
+
+            print(f"\n[!] Found cached target list from {data.get('timestamp')}")
+            print(f"    Contains {len(data.get('urls', []))} pre-resolved URLs.")
+
+            while True:
+                choice = (
+                    input("    Skip generation and use this list? (y/n): ")
+                    .strip()
+                    .lower()
+                )
+                if choice in ["y", "yes"]:
+                    return set(data.get("urls", {}))
+                elif choice in ["n", "no"]:
+                    return None
+        except Exception as e:
+            logger.warning(f"Could not load targets file: {e}")
+            return None
+
+    def generate(
+        self, use_hackerone: bool, use_bugcrowd: bool, use_intigriti: bool
+    ) -> bool:
+
+        all_urls = self.load_targets_list()
+        if all_urls:
+            self.save_targets_to_text(all_urls)  # type: ignore
+            return True
 
 
-            scanned_urls, current_findings = self.load_checkpoint()
-            
-            targets_to_scan = list(all_urls - scanned_urls)
-            
-            logger.info(f"Total Targets: {len(all_urls)}")
-            if scanned_urls:
-                logger.info(f"Already Scanned: {len(scanned_urls)}")
-                logger.info(f"Remaining: {len(targets_to_scan)}")
+        if GLOBALS.TARGETS_FILE.exists():
+            count = sum(1 for _ in open(GLOBALS.TARGETS_FILE))
+            print(f"\n[!] Found existing target list with {count} URLs.")
+            if input("    Skip generation and use this list? (y/n): ").lower() in ["y","yes"]:
+                return True
 
-            if not targets_to_scan:
-                logger.info("No targets remaining.")
-                return
-            
-            save_interval = 1000
-            processed_since_save = 0
-            
-            try:
-                with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-                    future_to_url = {
-                        executor.submit(self.check_path, url): url 
-                        for url in targets_to_scan
-                    }
+        all_programs = self.load_existing_programs()
+        if not all_programs:
+            logger.info("Fetching programs from APIs...")
+            if use_hackerone:
+                all_programs.extend(self.fetch_hackerone_programs())
+            if use_bugcrowd:
+                all_programs.extend(self.fetch_bugcrowd_programs())
+            if use_intigriti:
+                all_programs.extend(self.fetch_intigriti_programs())
 
-                    for future in tqdm(as_completed(future_to_url), total=len(targets_to_scan), ncols=100, desc="Scanning"):
-                        url = future_to_url[future]
+            HELPERS.store_in_cache(
+                "programs",
+                {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "data": all_programs,
+                },
+            )
 
-                        scanned_urls.add(url)
-                        processed_since_save += 1
+        if not all_programs:
+            logger.error("No programs found.")
+            return False
 
-                        try:
-                            result = future.result()
-                            if result:
-                                current_findings.append(result)
-                                
-                                msg = f" [FOUND] {result['url']} ({result['status']})"
-                                tqdm.write(f"\033[41m{msg}\033[0m")
-                                
-                                with open("findings.txt", "a") as f:
-                                    f.write(f"{json.dumps(result)}\n")
-                        except Exception:
-                            pass
+        logger.info(f"Enumerating subdomains for {len(all_programs)} programs...")
+        generated_urls = []
 
-                        if processed_since_save >= save_interval:
-                            self.save_checkpoint(scanned_urls, current_findings)
-                            processed_since_save = 0
+        try:
+            for prog in tqdm(all_programs, desc="Processing Programs"):
+                generated_urls.extend(self.process_program(prog))
+        except KeyboardInterrupt:
+            logger.warning(
+                "\nTarget generation interrupted! Saving what we have so far..."
+            )
 
-                logger.info(f"Scan finished. Total findings: {len(current_findings)}")
-                
-                with open(GLOBALS.FINDINGS_FILE, 'w') as f:
-                    json.dump(current_findings, f, indent=2)
-                
-                if GLOBALS.CHECKPOINT_FILE.exists():
-                    os.remove(GLOBALS.CHECKPOINT_FILE)
+        if not generated_urls:
+            logger.error("No URLs generated.")
+            return False
 
-            except KeyboardInterrupt:
-                tqdm.write("\n[!] Scan Interrupted. Saving state...")
-                self.save_checkpoint(scanned_urls, current_findings)
-                tqdm.write("[!] State saved. You can resume later.")
-                raise
-
+        self.save_targets_to_text(set(generated_urls))
+        return True
 
 def main():
     parser = argparse.ArgumentParser(
-        description="A scanner that could be used to discover certain files or paths on bug bounty programs."
+        description="ShadowScanner: BBP Discovery & Nuclei Orchestrator"
     )
 
+    parser.add_argument("--hackerone", "-H", action="store")
     parser.add_argument(
-        "--hackerone", "-H", action="store", help="Set the HackerOne api key"
+        "--subdomains", action="store_true", help="Enumerate subdomains"
     )
-
-    parser.add_argument(
-        "--status-codes",
-        "-sc",
-        type=int,
-        nargs="*",
-        default=[200, 206],
-        help="Status Codes that indicate a finding",
-    )
-
-    parser.add_argument(
-        "--subdomains",
-        action="store_true",
-        help="Enumerate subdomains from certificate transparency logs for wildcards",
-    )
-
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="count",
-        help="Enable verbose output showing detailed analysis of each target",
-    )
-
-    parser.add_argument(
-        "--path",
-        "-p",
-        default="/",
-        help="Path to scan for (default: /)",
-    )
-
-    parser.add_argument(
-        "--threads",
-        "-t",
-        type=int,
-        default=20,
-        help="Number of concurrent threads (default: 20)",
-    )
-
-    parser.add_argument(
-        "--exclude-content",
-        "-e",
-        nargs="*",
-        default=[],
-        help="List of strings that, if found in the response, mark the result as a false positive (case-insensitive).",
-    )
-
-    parser.add_argument(
-        "--include-content",
-        "-i",
-        nargs="*",
-        default=[],
-        help="List of strings that MUST be present in the response for it to be valid (case-insensitive).",
-    )
+    parser.add_argument("--verbose", "-v", action="count", default=0)
 
     args = parser.parse_args()
     validate_args(args)
-
     HELPERS.configure_logging(args.verbose)
 
     if args.hackerone:
-        hackerone_key = args.hackerone
-        HELPERS.store_in_cache("hackerone_api_key", hackerone_key)
-    else:
-        hackerone_key = HELPERS.get_from_cache("hackerone_api_key")
+        HELPERS.store_in_cache("hackerone_api_key", args.hackerone)
+    hackerone_key = HELPERS.get_from_cache("hackerone_api_key")
 
-    use_hackerone = True
-    use_bugcrowd = True
-    use_intigriti = True
-
-    if not hackerone_key:
-        logging.warning("No HackerOne key found. Skipping HackerOne.")
-
-    finder = TargetFinder(
-        hackerone_key=hackerone_key,
-        use_subdomains=args.subdomains,
-        target_path=args.path,
-        max_threads=args.threads,
-        success_status_codes=args.status_codes,
-        exclude_content=args.exclude_content,
-        include_content=args.include_content,
+    generator = TargetGenerator(
+        hackerone_key=hackerone_key, use_subdomains=args.subdomains
     )
 
-    finder.run(use_hackerone=use_hackerone, use_bugcrowd=use_bugcrowd, use_intigriti=use_intigriti)
+    generator.generate(
+        use_hackerone=bool(hackerone_key),
+        use_bugcrowd=True,
+        use_intigriti=True,
+    )
 
 
 if __name__ == "__main__":

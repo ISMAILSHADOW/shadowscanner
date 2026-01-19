@@ -1,6 +1,7 @@
 from pathlib import Path
 
-CACHE_FILE = Path(Path.home() / ".cache" / "shadowScanner" / "cache.json")
-CHECKPOINT_FILE = Path(Path.home() / ".cache" / "shadowScanner" / "checkpoint.json")
-TARGETS_FILE = Path(Path.home() / ".cache" / "shadowScanner" / "targets.json")
-FINDINGS_FILE = Path(Path.home() / ".cache" / "shadowScanner" / "findings.json")
+BASE_DIR = Path.home() / ".cache" / "shadowScanner"
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+CACHE_FILE = BASE_DIR / "cache.json"
+TARGETS_FILE = BASE_DIR / "targets.txt"
